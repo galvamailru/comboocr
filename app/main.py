@@ -173,18 +173,37 @@ def _extract_objects(doc: Any) -> List[Dict[str, Any]]:
     return objects
 
 
+def _make_pipeline_options() -> PdfPipelineOptions:
+    """Создать опции пайплайна; при поддержке — не пропускать колонтитулы (header/footer)."""
+    ocr_options = TesseractCliOcrOptions(lang=["rus", "eng"])
+    base_kw: Dict[str, Any] = {
+        "do_ocr": True,
+        "ocr_options": ocr_options,
+        "generate_picture_images": True,
+    }
+    # Включить захват колонтитулов, если Docling поддерживает соответствующую опцию
+    extra_opts = [
+        ("skip_header_footer", False),
+        ("skip_header_footers", False),
+        ("include_headers_footers", True),
+    ]
+    for opt_name, opt_value in extra_opts:
+        try:
+            pipeline_options = PdfPipelineOptions(**{**base_kw, opt_name: opt_value})
+            logger.info("comboocr: используется опция %s=%s для захвата колонтитулов", opt_name, opt_value)
+            return pipeline_options
+        except TypeError:
+            continue
+    return PdfPipelineOptions(**base_kw)
+
+
 def convert_pdf_with_docling(pdf_path: Path) -> Dict[str, Any]:
     """
     1) Docling конвертирует PDF в документ;
-    2) Извлекаются объекты (text/table/image);
+    2) Извлекаются объекты (text/table/image), включая колонтитулы при поддержке;
     3) Возвращается общий текст + список объектов.
     """
-    ocr_options = TesseractCliOcrOptions(lang=["rus", "eng"])
-    pipeline_options = PdfPipelineOptions(
-        do_ocr=True,
-        ocr_options=ocr_options,
-        generate_picture_images=True,
-    )
+    pipeline_options = _make_pipeline_options()
     converter = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
@@ -215,8 +234,17 @@ def document_to_markdown(objects: List[Dict[str, Any]], page_separator: str = "\
             elif el_type == "image":
                 cat = el.get("vlm_category") or ""
                 desc = (el.get("vlm_description") or "").strip()
+                parts_img = []
                 if cat or desc:
-                    page_blocks.append(f"*[Изображение: {cat}" + (f" — {desc}" if desc else "") + "]*")
+                    parts_img.append(f"*[Изображение: {cat}" + (f" — {desc}" if desc else "") + "]*")
+                if el.get("vlm_handwritten_text"):
+                    parts_img.append(f"Рукописный текст: {el.get('vlm_handwritten_text')}")
+                if el.get("vlm_has_signature"):
+                    parts_img.append("*[Подпись]*")
+                if el.get("vlm_date"):
+                    parts_img.append(f"Дата: {el.get('vlm_date')}")
+                if parts_img:
+                    page_blocks.append(" ".join(parts_img))
                 else:
                     page_blocks.append(text if text else "*(изображение)*")
             else:
@@ -380,6 +408,9 @@ async def parse_pdf(file: UploadFile = File(...)):
                     cls = classify_image_segment(img_bytes, seg_id)
                     obj_out["vlm_category"] = cls.get("category")
                     obj_out["vlm_description"] = cls.get("description")
+                    obj_out["vlm_handwritten_text"] = cls.get("handwritten_text")
+                    obj_out["vlm_has_signature"] = cls.get("has_signature")
+                    obj_out["vlm_date"] = cls.get("date")
                 except Exception as e:  # noqa: BLE001
                     logger.exception("comboocr: ошибка VLM для сегмента %s: %s", idx, e)
                     obj_out["vlm_category"] = "error"

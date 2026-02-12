@@ -326,8 +326,14 @@
             } else {
               bboxCell.textContent = obj.bbox ? JSON.stringify(obj.bbox) : "—";
             }
-            if ((obj.type || "").toLowerCase() === "image" && (obj.vlm_category || obj.vlm_description)) {
-              vlmCell.textContent = [obj.vlm_category, obj.vlm_description].filter(Boolean).join(" — ");
+            if ((obj.type || "").toLowerCase() === "image") {
+              const vlmParts = [];
+              if (obj.vlm_category) vlmParts.push(obj.vlm_category);
+              if (obj.vlm_description) vlmParts.push(obj.vlm_description);
+              if (obj.vlm_handwritten_text) vlmParts.push("Рукопись: " + (obj.vlm_handwritten_text).slice(0, 80) + ((obj.vlm_handwritten_text || "").length > 80 ? "…" : ""));
+              if (obj.vlm_has_signature) vlmParts.push("Подпись");
+              if (obj.vlm_date) vlmParts.push("Дата: " + obj.vlm_date);
+              vlmCell.textContent = vlmParts.length ? vlmParts.join(" | ") : "—";
             } else {
               vlmCell.textContent = "—";
             }

@@ -12,25 +12,39 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 
-SEGMENT_SYSTEM_PROMPT = """You are a precise classifier of small document image fragments.
+SEGMENT_SYSTEM_PROMPT = """You are a precise classifier and extractor for small document image fragments.
 
 You receive ONE small image fragment cut from a scanned document.
-Your task is to determine WHAT this fragment is.
+The fragment may contain: printed text, HANDWRITTEN text (рукописный текст), signature (подпись), date (дата), stamp, logo, etc.
 
-Return ONLY a SHORT JSON object with the following shape:
+Your tasks:
+1) Classify the fragment (category).
+2) If there is handwritten text — transcribe it into "handwritten_text".
+3) If there is a signature (подпись) — set "has_signature": true and optionally describe in "description".
+4) If there is a date (дата, число) — extract it into "date" (e.g. "12.03.2024" or "12 марта 2024 г.").
+
+Return ONLY a JSON object with the following shape (use null for absent fields):
 {
-  "category": "<one of: stamp, signature, logo, text_block, table_fragment, photo, other>",
-  "description": "<1 short Russian phrase describing what is visible>"
+  "category": "<one of: stamp, signature, logo, text_block, table_fragment, photo, handwritten_text, date_block, other>",
+  "description": "<1 short Russian phrase describing what is visible>",
+  "handwritten_text": "<transcribed handwritten text or null>",
+  "has_signature": <true if signature is present, else false>,
+  "date": "<extracted date string or null>"
 }
 
 Rules:
 - "stamp": round or rectangular stamps with company/organization text.
-- "signature": handwritten or stylized personal signature (without the descriptive text like "Подпись").
-- "logo": company / brand logo (icon + wordmark etc.), not a general picture.
-- "text_block": if this is mostly text without clear borders as a separate object.
+- "signature": handwritten or stylized personal signature (подпись).
+- "logo": company / brand logo (icon + wordmark etc.).
+- "text_block": mostly printed text without clear borders.
+- "handwritten_text": fragment is mainly handwritten text (рукописный текст) — transcribe it.
+- "date_block": fragment is mainly a date — extract into "date".
 - "table_fragment": grid-like structure of rows/columns.
 - "photo": real-world photo (people, objects, scenes).
 - "other": everything that does not fit above.
+- If both printed and handwritten text are present, include handwritten part in "handwritten_text".
+- If you see a signature, set "has_signature": true.
+- If you see a date (number, month, year), fill "date".
 
 Do NOT wrap the JSON in markdown. Do NOT add explanations. ONLY the JSON object.
 """
@@ -178,9 +192,13 @@ def classify_image_segment(image_png_bytes: bytes, segment_id: str) -> Dict[str,
         except json.JSONDecodeError:
             parsed = None
 
+    p = parsed or {}
     result: Dict[str, Any] = {
-        "category": (parsed or {}).get("category") or "other",
-        "description": (parsed or {}).get("description") or raw[:200],
+        "category": p.get("category") or "other",
+        "description": p.get("description") or raw[:200],
+        "handwritten_text": p.get("handwritten_text"),
+        "has_signature": p.get("has_signature") is True,
+        "date": p.get("date"),
         "raw": raw,
     }
     return result
