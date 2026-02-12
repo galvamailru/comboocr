@@ -382,6 +382,12 @@ async def parse_pdf(file: UploadFile = File(...)):
             if obj_type == "table":
                 page_no = obj.get("page")
                 bbox = obj.get("bbox")
+                # Если Docling не вернул номер страницы, но документ одностраничный — пробуем первую страницу
+                if page_no is None and len(page_images_list) == 1:
+                    page_no = 1
+                    obj_out["page"] = 1
+
+                obj_out["vlm_table_used"] = False
                 if page_no is not None and bbox and len(bbox) >= 4 and 1 <= page_no <= len(page_images_list):
                     try:
                         pil_page = page_images_list[page_no - 1]
@@ -390,15 +396,18 @@ async def parse_pdf(file: UploadFile = File(...)):
                             seg_id = f"page{page_no}_table{idx}"
                             table_result = run_table_ocr(crop_png, seg_id)
                             vlm_md = (table_result.get("markdown") or "").strip()
+                            obj_out["vlm_table_raw"] = table_result.get("raw")
                             if vlm_md:
                                 obj_out["text"] = vlm_md
                                 obj_out["vlm_table_markdown"] = vlm_md
+                                obj_out["vlm_table_used"] = True
                             obj_out["docling_text"] = obj.get("text") or ""
                     except Exception as e:  # noqa: BLE001
                         logger.exception("comboocr: ошибка VLM для таблицы %s: %s", idx, e)
                         obj_out["vlm_table_error"] = str(e)
                         obj_out["docling_text"] = obj.get("text") or ""
                 else:
+                    # Не удалось однозначно сопоставить страницу/bbox — используем только Docling
                     obj_out["docling_text"] = obj.get("text") or ""
 
             elif obj_type == "image" and obj.get("image_base64"):
@@ -406,11 +415,16 @@ async def parse_pdf(file: UploadFile = File(...)):
                     img_bytes = base64.b64decode(obj["image_base64"])
                     seg_id = f"page{obj.get('page') or 0}_img{idx}"
                     cls = classify_image_segment(img_bytes, seg_id)
-                    obj_out["vlm_category"] = cls.get("category")
+                    category = (cls.get("category") or "").lower()
+                    obj_out["vlm_category"] = category
                     obj_out["vlm_description"] = cls.get("description")
                     obj_out["vlm_handwritten_text"] = cls.get("handwritten_text")
                     obj_out["vlm_has_signature"] = cls.get("has_signature")
                     obj_out["vlm_date"] = cls.get("date")
+                    # Если VLM определила печать или подпись — меняем тип объекта,
+                    # чтобы в UI и markdown они шли как stamp / signature
+                    if category in {"stamp", "signature"}:
+                        obj_out["type"] = category
                 except Exception as e:  # noqa: BLE001
                     logger.exception("comboocr: ошибка VLM для сегмента %s: %s", idx, e)
                     obj_out["vlm_category"] = "error"

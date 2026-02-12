@@ -148,8 +148,7 @@
                   <th>Страница</th>
                   <th>Тип</th>
                   <th>BBox</th>
-                  <th>VLM (для изображений)</th>
-                  <th>Текст (фрагмент)</th>
+                  <th>Текст / VLM (фрагмент)</th>
                 </tr>
               </thead>
               <tbody></tbody>
@@ -316,33 +315,38 @@
             const pageCell = document.createElement("td");
             const typeCell = document.createElement("td");
             const bboxCell = document.createElement("td");
-            const vlmCell = document.createElement("td");
             const textCell = document.createElement("td");
             pageCell.textContent = (obj.page ?? "—").toString();
-            const displayType = (obj.type || "—") + (obj.vlm_category ? " (" + obj.vlm_category + ")" : "");
             typeCell.innerHTML = '<span class="pill ' + pillClass(obj.vlm_category || obj.type) + '">' + (obj.type || "—") + "</span>";
             if (Array.isArray(obj.bbox) && obj.bbox.length >= 4) {
               bboxCell.textContent = obj.bbox.map((x) => Number(x).toFixed(1)).join(", ");
             } else {
               bboxCell.textContent = obj.bbox ? JSON.stringify(obj.bbox) : "—";
             }
-            if ((obj.type || "").toLowerCase() === "image") {
+
+            const parts = [];
+            // Текст из Docling/VLM
+            const baseText = (obj.text || "").trim();
+            if (baseText) {
+              parts.push(baseText.slice(0, 300) + (baseText.length > 300 ? "…" : ""));
+            }
+            // Добавляем VLM-информацию для изображений (если есть)
+            if ((obj.type || "").toLowerCase() === "image" || obj.vlm_category || obj.vlm_description || obj.vlm_handwritten_text || obj.vlm_has_signature || obj.vlm_date) {
               const vlmParts = [];
-              if (obj.vlm_category) vlmParts.push(obj.vlm_category);
+              if (obj.vlm_category) vlmParts.push("VLM: " + obj.vlm_category);
               if (obj.vlm_description) vlmParts.push(obj.vlm_description);
-              if (obj.vlm_handwritten_text) vlmParts.push("Рукопись: " + (obj.vlm_handwritten_text).slice(0, 80) + ((obj.vlm_handwritten_text || "").length > 80 ? "…" : ""));
+              if (obj.vlm_handwritten_text) vlmParts.push("Рукопись: " + obj.vlm_handwritten_text.slice(0, 120) + (obj.vlm_handwritten_text.length > 120 ? "…" : ""));
               if (obj.vlm_has_signature) vlmParts.push("Подпись");
               if (obj.vlm_date) vlmParts.push("Дата: " + obj.vlm_date);
-              vlmCell.textContent = vlmParts.length ? vlmParts.join(" | ") : "—";
-            } else {
-              vlmCell.textContent = "—";
+              if (vlmParts.length) {
+                parts.push(vlmParts.join(" | "));
+              }
             }
-            textCell.textContent = (obj.text || "").slice(0, 300);
-            if ((obj.text || "").length > 300) textCell.textContent += "…";
+
+            textCell.textContent = parts.join("  •  ") || "—";
             row.appendChild(pageCell);
             row.appendChild(typeCell);
             row.appendChild(bboxCell);
-            row.appendChild(vlmCell);
             row.appendChild(textCell);
             structureTableBody.appendChild(row);
           });
