@@ -1,0 +1,18 @@
+# Сервис Combo OCR (Docling + VLM). Сервер vLLM с vision-моделью запускается отдельно;
+# подключение к нему — через переменные окружения (см. .env).
+version: "3.9"
+
+services:
+  comboocr:
+    build: .
+    image: comboocr:latest
+    container_name: comboocr
+    ports:
+      - "8020:8000"
+    env_file:
+      - .env
+    environment:
+      # Из контейнера localhost = сам контейнер. Укажите адрес хоста, где крутится vLLM:
+      # Windows/Mac: host.docker.internal; Linux: 172.17.0.1 или IP хоста
+      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://host.docker.internal:8000/v1}
+    restart: unless-stopped
