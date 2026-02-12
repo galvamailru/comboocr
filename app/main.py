@@ -11,6 +11,8 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import PictureItem, TableItem
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pdf2image import convert_from_path
 
 from app.vlm_client import classify_image_segment
 
@@ -30,6 +32,12 @@ app = FastAPI(
         "3) для изображений вызывается VLM для классификации (печать, подпись, логотип и т.п.)."
     ),
     version="0.1.0",
+)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=Path(__file__).parent / "static"),
+    name="static",
 )
 
 
@@ -188,9 +196,90 @@ def convert_pdf_with_docling(pdf_path: Path) -> Dict[str, Any]:
     return {"text": text, "objects": objects}
 
 
+def document_to_markdown(objects: List[Dict[str, Any]], page_separator: str = "\n\n---\n\n") -> str:
+    """Собрать markdown из списка объектов (по страницам). Для image используем vlm_category и vlm_description."""
+    by_page: Dict[int, List[Dict[str, Any]]] = {}
+    for el in objects:
+        p = el.get("page") if el.get("page") is not None else 1
+        by_page.setdefault(p, []).append(el)
+
+    parts: List[str] = []
+    for page_num in sorted(by_page.keys()):
+        page_blocks: List[str] = []
+        for el in by_page[page_num]:
+            el_type = (el.get("type") or "text").lower()
+            text = (el.get("text") or el.get("content") or "").strip()
+            if el_type == "table":
+                page_blocks.append(text if text else "*(таблица)*")
+            elif el_type == "image":
+                cat = el.get("vlm_category") or ""
+                desc = (el.get("vlm_description") or "").strip()
+                if cat or desc:
+                    page_blocks.append(f"*[Изображение: {cat}" + (f" — {desc}" if desc else "") + "]*")
+                else:
+                    page_blocks.append(text if text else "*(изображение)*")
+            else:
+                if text:
+                    page_blocks.append(text)
+        parts.append("\n\n".join(page_blocks))
+    return page_separator.join(parts)
+
+
+def build_pages_for_ui(pdf_path: Path, objects: List[Dict[str, Any]], dpi: int = 150) -> List[Dict[str, Any]]:
+    """Рендер страниц PDF в PNG и для каждой страницы — элементы с bbox_norm (0–1) для отрисовки в UI."""
+    pages_for_ui: List[Dict[str, Any]] = []
+    try:
+        page_images = convert_from_path(str(pdf_path), dpi=dpi)
+        for i, pil_img in enumerate(page_images):
+            page_num = i + 1
+            w_px, h_px = pil_img.size
+            w_pt = w_px * 72 / dpi
+            h_pt = h_px * 72 / dpi
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            image_base64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            elements_on_page: List[Dict[str, Any]] = []
+            for obj in objects:
+                if obj.get("page") != page_num:
+                    continue
+                bbox = obj.get("bbox")
+                if not bbox or len(bbox) < 4:
+                    elements_on_page.append({**obj, "bbox_norm": None})
+                    continue
+                left, top, right, bottom = [float(bbox[j]) for j in range(4)]
+                # PDF: origin bottom-left → нормализованные 0–1 (top-left origin для canvas)
+                x1 = left / w_pt
+                x2 = right / w_pt
+                y1 = 1.0 - (bottom / h_pt)
+                y2 = 1.0 - (top / h_pt)
+                elements_on_page.append({
+                    **obj,
+                    "bbox_norm": [round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4)],
+                })
+            pages_for_ui.append({
+                "page": page_num,
+                "image_base64": image_base64,
+                "image_width_px": w_px,
+                "image_height_px": h_px,
+                "elements": elements_on_page,
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    return pages_for_ui
+
+
 @app.get("/healthz")
 def healthz() -> Dict[str, str]:
     return {"status": "ok", "service": "comboocr"}
+
+
+@app.get("/")
+def index():
+    return JSONResponse(
+        status_code=307,
+        headers={"Location": "/static/index.html"},
+        content={},
+    )
 
 
 @app.post("/parse")
@@ -234,10 +323,17 @@ async def parse_pdf(file: UploadFile = File(...)):
                     obj_out["vlm_description"] = str(e)
             enhanced_objects.append(obj_out)
 
+        pages = build_pages_for_ui(tmp_path, enhanced_objects)
+        markdown = document_to_markdown(enhanced_objects)
+
         return {
             "filename": file.filename,
             "text": base_result["text"],
             "objects": enhanced_objects,
+            "structure": enhanced_objects,
+            "markdown": markdown,
+            "pages": pages,
+            "num_pages": len(pages),
         }
     except Exception as exc:  # noqa: BLE001
         logger.exception("comboocr: ошибка обработки PDF %s: %s", file.filename, exc)
