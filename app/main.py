@@ -9,12 +9,13 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import PictureItem, TableItem
+from PIL import Image
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pdf2image import convert_from_path
 
-from app.vlm_client import classify_image_segment
+from app.vlm_client import classify_image_segment, run_table_ocr
 
 logger = logging.getLogger(__name__)
 
@@ -225,11 +226,42 @@ def document_to_markdown(objects: List[Dict[str, Any]], page_separator: str = "\
     return page_separator.join(parts)
 
 
-def build_pages_for_ui(pdf_path: Path, objects: List[Dict[str, Any]], dpi: int = 150) -> List[Dict[str, Any]]:
-    """Рендер страниц PDF в PNG и для каждой страницы — элементы с bbox_norm (0–1) для отрисовки в UI."""
+def _crop_table_from_page_image(pil_img: Image.Image, bbox: List[float], dpi: int = 150) -> bytes:
+    """
+    Вырезать область таблицы из изображения страницы.
+    bbox: [left, top, right, bottom] в PDF-точках (origin bottom-left, y вверх).
+    Возвращает PNG bytes.
+    """
+    if not bbox or len(bbox) < 4:
+        return b""
+    w_px, h_px = pil_img.size
+    w_pt = w_px * 72 / dpi
+    h_pt = h_px * 72 / dpi
+    left_pt, top_pt, right_pt, bottom_pt = [float(bbox[i]) for i in range(4)]
+    # PDF: y вверх → в пикселях (y вниз): crop_y_upper = (h_pt - bottom_pt) / h_pt * h_px
+    x1 = max(0, min(w_px, left_pt * w_px / w_pt))
+    x2 = max(0, min(w_px, right_pt * w_px / w_pt))
+    y1 = max(0, min(h_px, (h_pt - bottom_pt) * h_px / h_pt))
+    y2 = max(0, min(h_px, (h_pt - top_pt) * h_px / h_pt))
+    if x2 <= x1 or y2 <= y1:
+        return b""
+    cropped = pil_img.crop((int(x1), int(y1), int(x2), int(y2)))
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def build_pages_for_ui(
+    pdf_path: Path,
+    objects: List[Dict[str, Any]],
+    dpi: int = 150,
+    page_images: Optional[List[Image.Image]] = None,
+) -> List[Dict[str, Any]]:
+    """Рендер страниц PDF в PNG и для каждой страницы — элементы с bbox_norm (0–1) для отрисовки в UI. Если передан page_images, повторный рендер не выполняется."""
     pages_for_ui: List[Dict[str, Any]] = []
     try:
-        page_images = convert_from_path(str(pdf_path), dpi=dpi)
+        if page_images is None:
+            page_images = convert_from_path(str(pdf_path), dpi=dpi)
         for i, pil_img in enumerate(page_images):
             page_num = i + 1
             w_px, h_px = pil_img.size
@@ -305,12 +337,43 @@ async def parse_pdf(file: UploadFile = File(...)):
 
         logger.info("comboocr: начало обработки %s, размер %s байт", file.filename, len(content))
         base_result = convert_pdf_with_docling(tmp_path)
-        objects: List[Dict[str, Any]] = base_result["objects"]
+        objects = base_result["objects"]
+
+        # Один раз рендерим страницы: для кропа таблиц и для UI
+        dpi = 150
+        try:
+            page_images_list = convert_from_path(str(tmp_path), dpi=dpi)
+        except Exception:  # noqa: BLE001
+            page_images_list = []
 
         enhanced_objects: List[Dict[str, Any]] = []
         for idx, obj in enumerate(objects):
             obj_out = dict(obj)
-            if (obj.get("type") or "").lower() == "image" and obj.get("image_base64"):
+            obj_type = (obj.get("type") or "").lower()
+
+            if obj_type == "table":
+                page_no = obj.get("page")
+                bbox = obj.get("bbox")
+                if page_no is not None and bbox and len(bbox) >= 4 and 1 <= page_no <= len(page_images_list):
+                    try:
+                        pil_page = page_images_list[page_no - 1]
+                        crop_png = _crop_table_from_page_image(pil_page, bbox, dpi=dpi)
+                        if crop_png:
+                            seg_id = f"page{page_no}_table{idx}"
+                            table_result = run_table_ocr(crop_png, seg_id)
+                            vlm_md = (table_result.get("markdown") or "").strip()
+                            if vlm_md:
+                                obj_out["text"] = vlm_md
+                                obj_out["vlm_table_markdown"] = vlm_md
+                            obj_out["docling_text"] = obj.get("text") or ""
+                    except Exception as e:  # noqa: BLE001
+                        logger.exception("comboocr: ошибка VLM для таблицы %s: %s", idx, e)
+                        obj_out["vlm_table_error"] = str(e)
+                        obj_out["docling_text"] = obj.get("text") or ""
+                else:
+                    obj_out["docling_text"] = obj.get("text") or ""
+
+            elif obj_type == "image" and obj.get("image_base64"):
                 try:
                     img_bytes = base64.b64decode(obj["image_base64"])
                     seg_id = f"page{obj.get('page') or 0}_img{idx}"
@@ -321,9 +384,10 @@ async def parse_pdf(file: UploadFile = File(...)):
                     logger.exception("comboocr: ошибка VLM для сегмента %s: %s", idx, e)
                     obj_out["vlm_category"] = "error"
                     obj_out["vlm_description"] = str(e)
+
             enhanced_objects.append(obj_out)
 
-        pages = build_pages_for_ui(tmp_path, enhanced_objects)
+        pages = build_pages_for_ui(tmp_path, enhanced_objects, dpi=dpi, page_images=page_images_list)
         markdown = document_to_markdown(enhanced_objects)
 
         return {

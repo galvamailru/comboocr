@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     vllm_model: str = "Qwen/Qwen2.5-VL-7B-Instruct"  # model name as registered on vLLM
     vllm_timeout_seconds: float = 120.0
     vllm_max_tokens: int = 512
+    # Для таблиц нужен больший лимит (рукописный текст, много ячеек)
+    vllm_max_tokens_table: int = 2048
 
 
 @lru_cache
