@@ -258,6 +258,28 @@ def document_to_markdown(objects: List[Dict[str, Any]], page_separator: str = "\
     return page_separator.join(parts)
 
 
+def _docling_table_bboxes(objects: List[Dict[str, Any]]) -> List[List[float]]:
+    """Список bbox объектов Docling с type=table (формат [x1, y_top, x2, y_bottom])."""
+    return [obj["bbox"] for obj in objects if obj.get("type") == "table" and obj.get("bbox") and len(obj.get("bbox", [])) >= 4]
+
+
+def _bbox_matches_docling_table(bbox: List[float], docling_table_bboxes: List[List[float]]) -> bool:
+    """True, если bbox заметно пересекается с одной из таблиц Docling (сохранение type=table)."""
+    if not bbox or len(bbox) < 4 or not docling_table_bboxes:
+        return False
+    x1, y_top, x2, y_bottom = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    for tb in docling_table_bboxes:
+        if len(tb) < 4:
+            continue
+        tx1, ty_top, tx2, ty_bottom = float(tb[0]), float(tb[1]), float(tb[2]), float(tb[3])
+        # пересечение по осям (PDF: y_top > y_bottom)
+        if x1 >= tx2 or x2 <= tx1 or y_top <= ty_bottom or y_bottom >= ty_top:
+            continue
+        # есть пересечение — считаем совпадением региона таблицы
+        return True
+    return False
+
+
 def build_pages_for_ui(
     pdf_path: Path,
     objects: List[Dict[str, Any]],
@@ -392,10 +414,13 @@ async def parse_pdf(file: UploadFile = File(...)):
             try:
                 result = run_page_ocr(page_png_bytes, objects_on_page, page_num)
                 elements = result.get("elements") or []
+                # Сохраняем тип table от Docling, если VLM вернул text для того же региона (переклассификация таблиц)
+                docling_tables_by_bbox = _docling_table_bboxes(objects_on_page)
                 for el in elements:
                     el["page"] = page_num
-                    if el.get("bbox") and len(el["bbox"]) >= 4:
-                        pass
+                    if el.get("type") == "text" and el.get("bbox") and len(el["bbox"]) >= 4:
+                        if _bbox_matches_docling_table(el["bbox"], docling_tables_by_bbox):
+                            el["type"] = "table"
                     enhanced_objects.append(el)
                 if vlm_system_prompt is None and result.get("system_prompt"):
                     vlm_system_prompt = result.get("system_prompt")
