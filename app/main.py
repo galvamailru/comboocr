@@ -414,7 +414,11 @@ async def parse_pdf(file: UploadFile = File(...)):
                     "system_prompt": vlm_system_prompt or "",
                 })
 
-        pages = build_pages_for_ui(tmp_path, enhanced_objects, dpi=dpi, page_images=page_images_list)
+        # Сегментацию для UI строим из объектов Docling (как в doclingocr), а не из VLM —
+        # тогда рамки на странице совпадают с doclingocr по качеству.
+        pages = build_pages_for_ui(
+            tmp_path, docling_objects, dpi=dpi, page_images=page_images_list
+        )
         markdown = document_to_markdown(enhanced_objects)
         full_text = "\n\n".join(
             (el.get("text") or "").strip() for el in enhanced_objects if (el.get("text") or "").strip()
@@ -425,6 +429,7 @@ async def parse_pdf(file: UploadFile = File(...)):
             "text": full_text,
             "objects": enhanced_objects,
             "structure": enhanced_objects,
+            "docling_objects": docling_objects,
             "markdown": markdown,
             "pages": pages,
             "num_pages": len(pages),
