@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pdf2image import convert_from_path
 
-from app.vlm_client import classify_image_segment, run_table_ocr
+from app.vlm_client import run_page_ocr
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +28,12 @@ logging.basicConfig(
 app = FastAPI(
     title="Combo OCR (Docling + VLM)",
     description=(
-        "1) Docling сегментирует PDF в текст, таблицы, изображения; "
-        "2) текст и таблицы берутся из Docling; "
-        "3) для изображений вызывается VLM для классификации (печать, подпись, логотип и т.п.)."
+        "1) Docling сегментирует PDF (объекты с bbox); "
+        "2) координаты приводятся к PDF-формату [x1, y_top, x2, y_bottom]; "
+        "3) каждая страница целиком отправляется в VLM с промптом, дополненным разметкой Docling; "
+        "4) VLM возвращает элементы (type, bbox, text) для улучшенного распознавания."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.mount(
@@ -81,6 +82,19 @@ def _bbox_to_list(bbox: Any) -> Optional[List[float]]:
         except (TypeError, ValueError):
             pass
     return None
+
+
+def bbox_to_pdf_format(bbox: Optional[List[float]]) -> Optional[List[float]]:
+    """
+    Привести bbox к формату PDF: [x1, y_top, x2, y_bottom].
+    PDF: (0,0) — левый нижний угол, Y растёт вверх → y_top (верх блока) > y_bottom (низ блока).
+    Из любых четырёх чисел: x1 <= x2, y_top >= y_bottom.
+    """
+    if not bbox or len(bbox) < 4:
+        return None
+    x1, x2 = min(float(bbox[0]), float(bbox[2])), max(float(bbox[0]), float(bbox[2]))
+    y_bottom, y_top = min(float(bbox[1]), float(bbox[3])), max(float(bbox[1]), float(bbox[3]))
+    return [round(x1, 1), round(y_top, 1), round(x2, 1), round(y_bottom, 1)]
 
 
 def _extract_page_and_bbox(element: Any) -> tuple[Optional[int], Optional[List[float]]]:
@@ -217,7 +231,7 @@ def convert_pdf_with_docling(pdf_path: Path) -> Dict[str, Any]:
 
 
 def document_to_markdown(objects: List[Dict[str, Any]], page_separator: str = "\n\n---\n\n") -> str:
-    """Собрать markdown из списка объектов (по страницам). Для image используем vlm_category и vlm_description."""
+    """Собрать markdown из списка объектов (по страницам). Элементы от VLM: type, text."""
     by_page: Dict[int, List[Dict[str, Any]]] = {}
     for el in objects:
         p = el.get("page") if el.get("page") is not None else 1
@@ -231,52 +245,17 @@ def document_to_markdown(objects: List[Dict[str, Any]], page_separator: str = "\
             text = (el.get("text") or el.get("content") or "").strip()
             if el_type == "table":
                 page_blocks.append(text if text else "*(таблица)*")
+            elif el_type == "stamp":
+                page_blocks.append(f"*[Печать: {text or '—'}]*")
+            elif el_type == "signature":
+                page_blocks.append(f"*[Подпись: {text or '—'}]*")
             elif el_type == "image":
-                cat = el.get("vlm_category") or ""
-                desc = (el.get("vlm_description") or "").strip()
-                parts_img = []
-                if cat or desc:
-                    parts_img.append(f"*[Изображение: {cat}" + (f" — {desc}" if desc else "") + "]*")
-                if el.get("vlm_handwritten_text"):
-                    parts_img.append(f"Рукописный текст: {el.get('vlm_handwritten_text')}")
-                if el.get("vlm_has_signature"):
-                    parts_img.append("*[Подпись]*")
-                if el.get("vlm_date"):
-                    parts_img.append(f"Дата: {el.get('vlm_date')}")
-                if parts_img:
-                    page_blocks.append(" ".join(parts_img))
-                else:
-                    page_blocks.append(text if text else "*(изображение)*")
+                page_blocks.append(text if text else "*(изображение)*")
             else:
                 if text:
                     page_blocks.append(text)
         parts.append("\n\n".join(page_blocks))
     return page_separator.join(parts)
-
-
-def _crop_table_from_page_image(pil_img: Image.Image, bbox: List[float], dpi: int = 150) -> bytes:
-    """
-    Вырезать область таблицы из изображения страницы.
-    bbox: [left, top, right, bottom] в PDF-точках (origin bottom-left, y вверх).
-    Возвращает PNG bytes.
-    """
-    if not bbox or len(bbox) < 4:
-        return b""
-    w_px, h_px = pil_img.size
-    w_pt = w_px * 72 / dpi
-    h_pt = h_px * 72 / dpi
-    left_pt, top_pt, right_pt, bottom_pt = [float(bbox[i]) for i in range(4)]
-    # PDF: y вверх → в пикселях (y вниз): crop_y_upper = (h_pt - bottom_pt) / h_pt * h_px
-    x1 = max(0, min(w_px, left_pt * w_px / w_pt))
-    x2 = max(0, min(w_px, right_pt * w_px / w_pt))
-    y1 = max(0, min(h_px, (h_pt - bottom_pt) * h_px / h_pt))
-    y2 = max(0, min(h_px, (h_pt - top_pt) * h_px / h_pt))
-    if x2 <= x1 or y2 <= y1:
-        return b""
-    cropped = pil_img.crop((int(x1), int(y1), int(x2), int(y2)))
-    buf = io.BytesIO()
-    cropped.save(buf, format="PNG")
-    return buf.getvalue()
 
 
 def build_pages_for_ui(
@@ -306,12 +285,13 @@ def build_pages_for_ui(
                 if not bbox or len(bbox) < 4:
                     elements_on_page.append({**obj, "bbox_norm": None})
                     continue
-                left, top, right, bottom = [float(bbox[j]) for j in range(4)]
-                # PDF: origin bottom-left → нормализованные 0–1 (top-left origin для canvas)
-                x1 = left / w_pt
-                x2 = right / w_pt
-                y1 = 1.0 - (bottom / h_pt)
-                y2 = 1.0 - (top / h_pt)
+                # bbox в PDF-формате: [x1, y_top, x2, y_bottom]; y_top > y_bottom
+                x1_pt, y_top_pt, x2_pt, y_bottom_pt = [float(bbox[j]) for j in range(4)]
+                # PDF origin bottom-left → нормализованные 0–1 (top-left origin для canvas)
+                x1 = x1_pt / w_pt
+                x2 = x2_pt / w_pt
+                y1 = 1.0 - (y_bottom_pt / h_pt)
+                y2 = 1.0 - (y_top_pt / h_pt)
                 elements_on_page.append({
                     **obj,
                     "bbox_norm": [round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4)],
@@ -345,10 +325,12 @@ def index():
 @app.post("/parse")
 async def parse_pdf(file: UploadFile = File(...)):
     """
-    Основной маршрут:
-    - сегментация PDF Docling'ом (text, table, image);
-    - для text/table берём текст Docling;
-    - для image отправляем crop в VLM для классификации (печать/подпись/логотип/...).
+    Пайплайн:
+    1) Docling сегментирует PDF → объекты (type, page, bbox).
+    2) Bbox приводятся к PDF-формату [x1, y_top, x2, y_bottom].
+    3) Для каждой страницы: изображение страницы + список объектов Docling для этой страницы
+       отправляются в VLM с промптом извлечения; VLM возвращает элементы (type, bbox, text).
+    4) Результат — объединённые элементы по всем страницам.
     """
     if file.content_type not in ("application/pdf", "application/octet-stream"):
         return JSONResponse(
@@ -365,79 +347,68 @@ async def parse_pdf(file: UploadFile = File(...)):
 
         logger.info("comboocr: начало обработки %s, размер %s байт", file.filename, len(content))
         base_result = convert_pdf_with_docling(tmp_path)
-        objects = base_result["objects"]
+        docling_objects = base_result["objects"]
 
-        # Один раз рендерим страницы: для кропа таблиц и для UI
+        # Приводим bbox к PDF-формату [x1, y_top, x2, y_bottom] для каждой объекта
+        for obj in docling_objects:
+            bbox = obj.get("bbox")
+            pdf_bbox = bbox_to_pdf_format(bbox)
+            if pdf_bbox is not None:
+                obj["bbox"] = pdf_bbox
+            # Номер страницы обязателен для группировки
+            if obj.get("page") is None and docling_objects:
+                obj["page"] = 1
+
         dpi = 150
         try:
             page_images_list = convert_from_path(str(tmp_path), dpi=dpi)
         except Exception:  # noqa: BLE001
             page_images_list = []
 
+        # Группируем объекты Docling по страницам
+        by_page: Dict[int, List[Dict[str, Any]]] = {}
+        for obj in docling_objects:
+            p = obj.get("page") if obj.get("page") is not None else 1
+            by_page.setdefault(p, []).append(obj)
+        # Страницы без объектов Docling тоже обрабатываем VLM (пустой список в промпте)
+        for i in range(1, len(page_images_list) + 1):
+            if i not in by_page:
+                by_page[i] = []
+
         enhanced_objects: List[Dict[str, Any]] = []
-        for idx, obj in enumerate(objects):
-            obj_out = dict(obj)
-            obj_type = (obj.get("type") or "").lower()
-
-            if obj_type == "table":
-                page_no = obj.get("page")
-                bbox = obj.get("bbox")
-                # Если Docling не вернул номер страницы, но документ одностраничный — пробуем первую страницу
-                if page_no is None and len(page_images_list) == 1:
-                    page_no = 1
-                    obj_out["page"] = 1
-
-                obj_out["vlm_table_used"] = False
-                if page_no is not None and bbox and len(bbox) >= 4 and 1 <= page_no <= len(page_images_list):
-                    try:
-                        pil_page = page_images_list[page_no - 1]
-                        crop_png = _crop_table_from_page_image(pil_page, bbox, dpi=dpi)
-                        if crop_png:
-                            seg_id = f"page{page_no}_table{idx}"
-                            table_result = run_table_ocr(crop_png, seg_id)
-                            vlm_md = (table_result.get("markdown") or "").strip()
-                            obj_out["vlm_table_raw"] = table_result.get("raw")
-                            if vlm_md:
-                                obj_out["text"] = vlm_md
-                                obj_out["vlm_table_markdown"] = vlm_md
-                                obj_out["vlm_table_used"] = True
-                            obj_out["docling_text"] = obj.get("text") or ""
-                    except Exception as e:  # noqa: BLE001
-                        logger.exception("comboocr: ошибка VLM для таблицы %s: %s", idx, e)
-                        obj_out["vlm_table_error"] = str(e)
-                        obj_out["docling_text"] = obj.get("text") or ""
-                else:
-                    # Не удалось однозначно сопоставить страницу/bbox — используем только Docling
-                    obj_out["docling_text"] = obj.get("text") or ""
-
-            elif obj_type == "image" and obj.get("image_base64"):
-                try:
-                    img_bytes = base64.b64decode(obj["image_base64"])
-                    seg_id = f"page{obj.get('page') or 0}_img{idx}"
-                    cls = classify_image_segment(img_bytes, seg_id)
-                    category = (cls.get("category") or "").lower()
-                    obj_out["vlm_category"] = category
-                    obj_out["vlm_description"] = cls.get("description")
-                    obj_out["vlm_handwritten_text"] = cls.get("handwritten_text")
-                    obj_out["vlm_has_signature"] = cls.get("has_signature")
-                    obj_out["vlm_date"] = cls.get("date")
-                    # Если VLM определила печать или подпись — меняем тип объекта,
-                    # чтобы в UI и markdown они шли как stamp / signature
-                    if category in {"stamp", "signature"}:
-                        obj_out["type"] = category
-                except Exception as e:  # noqa: BLE001
-                    logger.exception("comboocr: ошибка VLM для сегмента %s: %s", idx, e)
-                    obj_out["vlm_category"] = "error"
-                    obj_out["vlm_description"] = str(e)
-
-            enhanced_objects.append(obj_out)
+        for page_num in sorted(by_page.keys()):
+            objects_on_page = by_page[page_num]
+            if page_num < 1 or page_num > len(page_images_list):
+                for obj in objects_on_page:
+                    enhanced_objects.append({**obj})
+                continue
+            pil_img = page_images_list[page_num - 1]
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            page_png_bytes = buf.getvalue()
+            try:
+                result = run_page_ocr(page_png_bytes, objects_on_page, page_num)
+                elements = result.get("elements") or []
+                for el in elements:
+                    el["page"] = page_num
+                    if el.get("bbox") and len(el["bbox"]) >= 4:
+                        # bbox уже в PDF [x1, y_top, x2, y_bottom]
+                        pass
+                    enhanced_objects.append(el)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("comboocr: ошибка VLM для страницы %s: %s", page_num, e)
+                for obj in objects_on_page:
+                    enhanced_objects.append({**obj, "vlm_error": str(e)})
 
         pages = build_pages_for_ui(tmp_path, enhanced_objects, dpi=dpi, page_images=page_images_list)
         markdown = document_to_markdown(enhanced_objects)
+        full_text = "\n\n".join(
+            (el.get("text") or "").strip() for el in enhanced_objects if (el.get("text") or "").strip()
+        )
 
         return {
             "filename": file.filename,
-            "text": base_result["text"],
+            "text": full_text,
             "objects": enhanced_objects,
             "structure": enhanced_objects,
             "markdown": markdown,

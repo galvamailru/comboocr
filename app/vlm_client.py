@@ -1,85 +1,109 @@
 """
-Simple VLM client for classifying cropped document image segments (печать, подпись, логотип, фото и т.п.).
-
-Uses OpenAI-compatible API served by vLLM (Qwen-VL / Ministral / etc.).
+VLM: отправка целой страницы PDF с промптом, дополненным разметкой Docling (тип, страница, bbox в PDF-координатах).
+Один запрос на страницу → JSON с элементами (type, bbox, text).
 """
 import base64
+import json
 import logging
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional
 
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
-SEGMENT_SYSTEM_PROMPT = """You are a precise classifier and extractor for small document image fragments.
+PAGE_OCR_SYSTEM_PROMPT = """У вас есть разметка документа в виде списка объектов. Каждый объект задан как:
+тип объекта, страница, координаты,
+где координаты — четыре числа: x1, y_top, x2, y_bottom,
+и система координат стандартная для PDF:
+начало (0, 0) — левый нижний угол страницы,
+ось X → вправо, ось Y ↑ вверх,
+значит: чем больше y_top, тем выше расположен блок.
 
-You receive ONE small image fragment cut from a scanned document.
-The fragment may contain: printed text, HANDWRITTEN text (рукописный текст), signature (подпись), date (дата), stamp, logo, etc.
+Также приложены изображения всех страниц.
 
-Your tasks:
-1) Classify the fragment (category).
-2) If there is handwritten text — transcribe it into "handwritten_text".
-3) If there is a signature (подпись) — set "has_signature": true and optionally describe in "description".
-4) If there is a date (дата, число) — extract it into "date" (e.g. "12.03.2024" or "12 марта 2024 г.").
+Ваша задача:
+Для каждого объекта определите его тип по содержимому и визуальному контексту, строго по следующим правилам:
 
-Return ONLY a JSON object with the following shape (use null for absent fields):
+text: любой связный текстовый блок — заголовки, абзацы, списки, колонтитулы, номера страниц, подписи к рисункам. Группируйте только логически связанные фрагменты (например, один пункт списка, один абзац). Не объединяйте всю страницу в один элемент.
+
+image: графические объекты без структурированного текста — логотипы, фотографии, диаграммы, иконки. Если внутри есть краткий текст (напр., «Рис. 1»), укажите его в "text" как описание.
+
+table: явные таблицы с ячейками, строками и столбцами (даже без сетки). В "text" верните Markdown-таблицу (|...|), восстанавливая структуру.
+
+stamp: официальные оттиски (круглые, прямоугольные, овальные) с текстом внутри. Извлеките весь видимый текст максимально полно — не заменяйте на «штамп». Если подпись рукой внутри штампа — создайте два элемента: stamp + signature.
+
+signature: исключительно рукописные автографы/росчерки. Не путать с печатным текстом.
+
+❌ Не включайте водяные знаки, фоновые узоры, артефакты без смысла.
+
+Сгруппируйте и объедините только те текстовые фрагменты, которые:
+- имеют близкие y_top (разница < 15 pt),
+- выровнены по x1 или образуют последовательность (например, нумерованный список),
+- визуально принадлежат одному абзацу/пункту.
+
+Отсортируйте элементы внутри каждой страницы:
+- по y_top убыванию (сверху вниз),
+- при равных y_top — по x1 возрастанию (слева направо).
+
+Верните только JSON, без пояснений, в строгом формате:
 {
-  "category": "<one of: stamp, signature, logo, text_block, table_fragment, photo, handwritten_text, date_block, other>",
-  "description": "<1 short Russian phrase describing what is visible>",
-  "handwritten_text": "<transcribed handwritten text or null>",
-  "has_signature": <true if signature is present, else false>,
-  "date": "<extracted date string or null>"
+  "page_rotation_degrees": 0,
+  "elements": [
+    {
+      "type": "text",
+      "bbox": [x1, y_top, x2, y_bottom],
+      "text": "Содержимое блока"
+    },
+    ...
+  ]
 }
 
-Rules:
-- "stamp": round or rectangular stamps with company/organization text.
-- "signature": handwritten or stylized personal signature (подпись).
-- "logo": company / brand logo (icon + wordmark etc.).
-- "text_block": mostly printed text without clear borders.
-- "handwritten_text": fragment is mainly handwritten text (рукописный текст) — transcribe it.
-- "date_block": fragment is mainly a date — extract into "date".
-- "table_fragment": grid-like structure of rows/columns.
-- "photo": real-world photo (people, objects, scenes).
-- "other": everything that does not fit above.
-- If both printed and handwritten text are present, include handwritten part in "handwritten_text".
-- If you see a signature, set "has_signature": true.
-- If you see a date (number, month, year), fill "date".
-
-Do NOT wrap the JSON in markdown. Do NOT add explanations. ONLY the JSON object.
-"""
+page_rotation_degrees всегда 0 (если не указано иное).
+"text" — строка, без экранирования \\n внутри (используйте \\n для переносов строк в одном блоке).
+Не добавляйте поля, кроме указанных.
+Действуйте только на основе предоставленных координат и изображений. Не выдумывайте текст — выводите только то, что видно или логически следует из макета."""
 
 
-TABLE_OCR_SYSTEM_PROMPT = """You are an OCR system for document tables.
-
-You receive ONE image: a cropped region of a document page containing a TABLE (rows and columns).
-The table may contain:
-- Printed text (typewriter, printer)
-- Handwritten text (рукописный текст)
-
-Your task: extract ALL text from the table and return it as a single Markdown table.
-
-Rules:
-- Use pipe | to separate columns.
-- Use a row of dashes with pipes (e.g. |---|---|) after the header row.
-- Preserve row and column structure. If a cell is empty, leave it empty between pipes.
-- Recognize both printed and handwritten text; transcribe handwritten text as accurately as possible.
-- Use Russian and English as in the source.
-- Do NOT add any text before or after the table (no "Here is the table", no explanations).
-- Output ONLY the Markdown table.
-"""
-
-TABLE_OCR_USER_PROMPT = """Extract the table from this image as Markdown. Include all text (printed and handwritten). Output only the Markdown table, nothing else."""
+def _build_objects_list_for_prompt(objects: List[Dict[str, Any]]) -> str:
+    """Форматирует список объектов для вставки в промпт. bbox уже в формате [x1, y_top, x2, y_bottom]."""
+    lines = []
+    for i, obj in enumerate(objects):
+        t = obj.get("type") or "unknown"
+        p = obj.get("page") or "?"
+        bbox = obj.get("bbox")
+        if bbox and len(bbox) >= 4:
+            bstr = ", ".join(f"{float(x):.1f}" for x in bbox[:4])
+            lines.append(f"  {i+1}. type={t}, page={p}, bbox=[{bstr}]")
+        else:
+            lines.append(f"  {i+1}. type={t}, page={p}, bbox=нет координат")
+    return "\n".join(lines) if lines else "  (нет объектов)"
 
 
-def run_table_ocr(
-    image_png_bytes: bytes,
-    segment_id: str,
-    max_tokens: Optional[int] = None,
+def _extract_json_from_response(raw: str) -> Optional[str]:
+    raw = raw.strip()
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
+    if m:
+        return m.group(1).strip()
+    if raw.startswith("{"):
+        return raw
+    start = raw.find("{")
+    if start >= 0:
+        return raw[start:]
+    return None
+
+
+def run_page_ocr(
+    page_image_png_bytes: bytes,
+    docling_objects_for_page: List[Dict[str, Any]],
+    page_num: int,
 ) -> Dict[str, Any]:
     """
-    Отправить вырезанное изображение таблицы в VLM; вернуть Markdown-таблицу.
-    Returns: {"markdown": str, "raw": str}
+    Отправить изображение одной страницы и разметку Docling (объекты с bbox в PDF-формате)
+    в VLM; вернуть распознанные элементы.
+    Returns: {"elements": [...], "page_rotation_degrees": float, "raw": str}
+    Каждый element: {"type": str, "bbox": [x1, y_top, x2, y_bottom], "text": str}
     """
     settings = get_settings()
     try:
@@ -92,114 +116,56 @@ def run_table_ocr(
         api_key=settings.vllm_api_key or "dummy",
     )
 
-    b64 = base64.b64encode(image_png_bytes).decode("ascii")
-    payload_size_kb = (len(b64) * 3 // 4) // 1024
-    tokens_limit = max_tokens if max_tokens is not None else settings.vllm_max_tokens_table
+    b64 = base64.b64encode(page_image_png_bytes).decode("ascii")
+    payload_kb = (len(b64) * 3 // 4) // 1024
+    max_tokens = getattr(settings, "vllm_max_tokens_table", None) or getattr(settings, "vllm_max_tokens", 2048)
     logger.info(
-        "VLM: отправка таблицы %s (размер PNG ~%s КБ, max_tokens=%s)",
-        segment_id,
-        payload_size_kb,
-        tokens_limit,
+        "VLM: страница %s — отправка (PNG ~%s КБ, объектов Docling: %s)",
+        page_num,
+        payload_kb,
+        len(docling_objects_for_page),
     )
 
-    content = [
+    objects_block = _build_objects_list_for_prompt(docling_objects_for_page)
+    user_text = (
+        f"Текущая страница: {page_num}. Изображение страницы приложено.\n\n"
+        f"Объекты Docling для этой страницы (координаты в PDF: x1, y_top, x2, y_bottom):\n{objects_block}\n\n"
+        "Верните JSON с полем \"elements\" для элементов этой страницы (и \"page_rotation_degrees\": 0)."
+    )
+
+    content: List[Dict[str, Any]] = [
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-        {"type": "text", "text": TABLE_OCR_USER_PROMPT},
+        {"type": "text", "text": user_text},
     ]
 
     try:
         resp = client.chat.completions.create(
             model=settings.vllm_model,
             messages=[
-                {"role": "system", "content": TABLE_OCR_SYSTEM_PROMPT},
+                {"role": "system", "content": PAGE_OCR_SYSTEM_PROMPT},
                 {"role": "user", "content": content},
             ],
-            max_tokens=tokens_limit,
+            max_tokens=max_tokens,
             timeout=settings.vllm_timeout_seconds,
             temperature=0.0,
             top_p=1.0,
         )
     except Exception as e:  # noqa: BLE001
-        logger.exception("VLM: ошибка при распознавании таблицы %s: %s", segment_id, e)
-        return {"markdown": "", "raw": f"VLM error: {e}"}
+        logger.exception("VLM: ошибка для страницы %s: %s", page_num, e)
+        return {"elements": [], "page_rotation_degrees": 0.0, "raw": f"VLM error: {e}"}
 
     choice = resp.choices[0] if resp.choices else None
     raw = (choice.message.content if choice and choice.message else "").strip()
-    logger.info("VLM: таблица %s — ответ получен, длина %s символов", segment_id, len(raw))
-    return {"markdown": raw, "raw": raw}
+    logger.info("VLM: страница %s — ответ получен, %s символов", page_num, len(raw))
 
-
-def classify_image_segment(image_png_bytes: bytes, segment_id: str) -> Dict[str, Any]:
-    """
-    Send one cropped image segment to VLM and return a dict:
-    {"category": str, "description": str, "raw": str}
-    """
-    settings = get_settings()
+    extracted = _extract_json_from_response(raw)
+    if not extracted:
+        return {"elements": [], "page_rotation_degrees": 0.0, "raw": raw}
+    normalized = extracted.replace(",]", "]").replace(",}", "}")
     try:
-        from openai import OpenAI
-    except ImportError as e:  # pragma: no cover - runtime dependency
-        raise RuntimeError("Install openai package: pip install openai") from e
-
-    client = OpenAI(
-        base_url=settings.vllm_base_url.rstrip("/"),
-        api_key=settings.vllm_api_key or "dummy",
-    )
-
-    b64 = base64.b64encode(image_png_bytes).decode("ascii")
-    payload_size_kb = (len(b64) * 3 // 4) // 1024
-    logger.info(
-        "VLM: отправка сегмента %s (размер PNG ~%s КБ) в модель %s",
-        segment_id,
-        payload_size_kb,
-        settings.vllm_model,
-    )
-
-    content = [
-        {
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{b64}"},
-        },
-    ]
-
-    try:
-        resp = client.chat.completions.create(
-            model=settings.vllm_model,
-            messages=[
-                {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            max_tokens=settings.vllm_max_tokens,
-            timeout=settings.vllm_timeout_seconds,
-            temperature=0.0,
-            top_p=1.0,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.exception("VLM: ошибка при классификации сегмента %s: %s", segment_id, e)
-        return {"category": "error", "description": f"VLM error: {e}", "raw": ""}
-
-    choice = resp.choices[0] if resp.choices else None
-    raw = (choice.message.content if choice and choice.message else "") or ""
-    raw = raw.strip()
-    logger.info("VLM: сегмент %s — ответ получен, длина %s символов", segment_id, len(raw))
-
-    # Минимальный JSON-парсинг без сложных восстановлений
-    import json
-
-    parsed: Optional[Dict[str, Any]] = None
-    if raw.startswith("{"):
-        try:
-            parsed = json.loads(raw.replace(",}", "}"))
-        except json.JSONDecodeError:
-            parsed = None
-
-    p = parsed or {}
-    result: Dict[str, Any] = {
-        "category": p.get("category") or "other",
-        "description": p.get("description") or raw[:200],
-        "handwritten_text": p.get("handwritten_text"),
-        "has_signature": p.get("has_signature") is True,
-        "date": p.get("date"),
-        "raw": raw,
-    }
-    return result
-
+        data = json.loads(normalized)
+    except json.JSONDecodeError:
+        return {"elements": [], "page_rotation_degrees": 0.0, "raw": raw}
+    elements = data.get("elements") if isinstance(data.get("elements"), list) else []
+    rotation = float(data.get("page_rotation_degrees", 0) or 0)
+    return {"elements": elements, "page_rotation_degrees": rotation, "raw": raw}

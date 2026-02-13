@@ -137,6 +137,8 @@
                 <span><i style="border-color: #2563eb; background: rgba(37,99,235,0.15);"></i> текст</span>
                 <span><i style="border-color: #16a34a; background: rgba(22,163,74,0.15);"></i> таблица</span>
                 <span><i style="border-color: #b45309; background: rgba(245,158,11,0.15);"></i> изображение</span>
+                <span><i style="border-color: #b91c1c; background: rgba(185,28,28,0.15);"></i> печать</span>
+                <span><i style="border-color: #6b21a8; background: rgba(107,33,168,0.15);"></i> подпись</span>
               </div>
               <div class="page-cards" id="pageCards"></div>
             </div>
@@ -182,9 +184,11 @@
       const metaEl = document.getElementById("meta");
 
       const BBOX_COLORS = {
-        text:  { stroke: "#2563eb", fill: "rgba(37,99,235,0.12)" },
-        table: { stroke: "#16a34a", fill: "rgba(22,163,74,0.12)" },
-        image: { stroke: "#b45309", fill: "rgba(245,158,11,0.12)" },
+        text:      { stroke: "#2563eb", fill: "rgba(37,99,235,0.12)" },
+        table:     { stroke: "#16a34a", fill: "rgba(22,163,74,0.12)" },
+        image:     { stroke: "#b45309", fill: "rgba(245,158,11,0.12)" },
+        stamp:     { stroke: "#b91c1c", fill: "rgba(185,28,28,0.12)" },
+        signature: { stroke: "#6b21a8", fill: "rgba(107,33,168,0.12)" },
       };
 
       let fakeProgressTimer = null;
