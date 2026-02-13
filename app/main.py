@@ -376,6 +376,8 @@ async def parse_pdf(file: UploadFile = File(...)):
                 by_page[i] = []
 
         enhanced_objects: List[Dict[str, Any]] = []
+        page_prompts: List[Dict[str, Any]] = []
+        vlm_system_prompt: Optional[str] = None
         for page_num in sorted(by_page.keys()):
             objects_on_page = by_page[page_num]
             if page_num < 1 or page_num > len(page_images_list):
@@ -392,13 +394,24 @@ async def parse_pdf(file: UploadFile = File(...)):
                 for el in elements:
                     el["page"] = page_num
                     if el.get("bbox") and len(el["bbox"]) >= 4:
-                        # bbox уже в PDF [x1, y_top, x2, y_bottom]
                         pass
                     enhanced_objects.append(el)
+                if vlm_system_prompt is None and result.get("system_prompt"):
+                    vlm_system_prompt = result.get("system_prompt")
+                page_prompts.append({
+                    "page": page_num,
+                    "user_prompt": result.get("user_prompt") or "",
+                    "system_prompt": result.get("system_prompt") or "",
+                })
             except Exception as e:  # noqa: BLE001
                 logger.exception("comboocr: ошибка VLM для страницы %s: %s", page_num, e)
                 for obj in objects_on_page:
                     enhanced_objects.append({**obj, "vlm_error": str(e)})
+                page_prompts.append({
+                    "page": page_num,
+                    "user_prompt": "",
+                    "system_prompt": vlm_system_prompt or "",
+                })
 
         pages = build_pages_for_ui(tmp_path, enhanced_objects, dpi=dpi, page_images=page_images_list)
         markdown = document_to_markdown(enhanced_objects)
@@ -414,6 +427,8 @@ async def parse_pdf(file: UploadFile = File(...)):
             "markdown": markdown,
             "pages": pages,
             "num_pages": len(pages),
+            "page_prompts": page_prompts,
+            "vlm_system_prompt": vlm_system_prompt or "",
         }
     except Exception as exc:  # noqa: BLE001
         logger.exception("comboocr: ошибка обработки PDF %s: %s", file.filename, exc)

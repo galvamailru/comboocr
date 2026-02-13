@@ -152,7 +152,13 @@ def run_page_ocr(
         )
     except Exception as e:  # noqa: BLE001
         logger.exception("VLM: ошибка для страницы %s: %s", page_num, e)
-        return {"elements": [], "page_rotation_degrees": 0.0, "raw": f"VLM error: {e}"}
+        return {
+            "elements": [],
+            "page_rotation_degrees": 0.0,
+            "raw": f"VLM error: {e}",
+            "user_prompt": user_text,
+            "system_prompt": PAGE_OCR_SYSTEM_PROMPT,
+        }
 
     choice = resp.choices[0] if resp.choices else None
     raw = (choice.message.content if choice and choice.message else "").strip()
@@ -160,12 +166,30 @@ def run_page_ocr(
 
     extracted = _extract_json_from_response(raw)
     if not extracted:
-        return {"elements": [], "page_rotation_degrees": 0.0, "raw": raw}
+        return {
+            "elements": [],
+            "page_rotation_degrees": 0.0,
+            "raw": raw,
+            "user_prompt": user_text,
+            "system_prompt": PAGE_OCR_SYSTEM_PROMPT,
+        }
     normalized = extracted.replace(",]", "]").replace(",}", "}")
     try:
         data = json.loads(normalized)
     except json.JSONDecodeError:
-        return {"elements": [], "page_rotation_degrees": 0.0, "raw": raw}
+        return {
+            "elements": [],
+            "page_rotation_degrees": 0.0,
+            "raw": raw,
+            "user_prompt": user_text,
+            "system_prompt": PAGE_OCR_SYSTEM_PROMPT,
+        }
     elements = data.get("elements") if isinstance(data.get("elements"), list) else []
     rotation = float(data.get("page_rotation_degrees", 0) or 0)
-    return {"elements": elements, "page_rotation_degrees": rotation, "raw": raw}
+    return {
+        "elements": elements,
+        "page_rotation_degrees": rotation,
+        "raw": raw,
+        "user_prompt": user_text,
+        "system_prompt": PAGE_OCR_SYSTEM_PROMPT,
+    }

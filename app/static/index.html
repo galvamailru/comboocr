@@ -102,6 +102,7 @@
       .json-raw { margin-top: 16px; }
       .json-raw summary { cursor: pointer; font-weight: 500; color: #475569; }
       .json-raw pre { margin-top: 8px; max-height: 400px; overflow: auto; background: #f8fafc; padding: 12px; border-radius: 8px; font-size: 0.8rem; }
+      .prompt-pre { white-space: pre-wrap; word-break: break-word; margin: 8px 0 0 0; max-height: 50vh; overflow: auto; background: #f8fafc; padding: 12px; border-radius: 8px; font-size: 0.8rem; line-height: 1.4; }
     </style>
   </head>
   <body>
@@ -129,6 +130,7 @@
             <button type="button" data-tab="pages" class="active">Страницы с bbox</button>
             <button type="button" data-tab="structure">Структура (JSON)</button>
             <button type="button" data-tab="markdown">Markdown</button>
+            <button type="button" data-tab="prompt">Промпт для VLM</button>
           </div>
           <div id="pagesPanel" class="panel active" data-tab="pages">
             <div class="pages-section">
@@ -164,6 +166,20 @@
           <div id="markdownPanel" class="panel output-text" data-tab="markdown">
             <pre id="markdownContent"></pre>
           </div>
+          <div id="promptPanel" class="panel" data-tab="prompt">
+            <h3>Что получает модель</h3>
+            <p class="muted" style="margin-bottom: 12px;">Текст промпта, отправляемый в VLM вместе с изображением страницы (разметка Docling с bbox в PDF-координатах).</p>
+            <label for="promptPageSelect" style="display:block; margin-bottom: 8px; font-weight: 500;">Страница:</label>
+            <select id="promptPageSelect" style="margin-bottom: 12px; padding: 8px 12px; min-width: 120px;"></select>
+            <div style="margin-bottom: 16px;">
+              <strong>User-сообщение (с разметкой Docling):</strong>
+              <pre id="promptUserText" class="prompt-pre"></pre>
+            </div>
+            <details style="margin-top: 16px;">
+              <summary style="cursor: pointer; font-weight: 500;">Системный промпт</summary>
+              <pre id="promptSystemText" class="prompt-pre"></pre>
+            </details>
+          </div>
           <p class="meta" id="meta"></p>
         </div>
       </div>
@@ -182,6 +198,9 @@
       const jsonRaw = document.getElementById("jsonRaw");
       const markdownContent = document.getElementById("markdownContent");
       const metaEl = document.getElementById("meta");
+      const promptPageSelect = document.getElementById("promptPageSelect");
+      const promptUserText = document.getElementById("promptUserText");
+      const promptSystemText = document.getElementById("promptSystemText");
 
       const BBOX_COLORS = {
         text:      { stroke: "#2563eb", fill: "rgba(37,99,235,0.12)" },
@@ -361,6 +380,29 @@
             return copy;
           });
           jsonRaw.textContent = JSON.stringify(forJson, null, 2);
+
+          const pagePrompts = data.page_prompts || [];
+          const systemPrompt = data.vlm_system_prompt || "";
+          promptPageSelect.innerHTML = "";
+          if (pagePrompts.length) {
+            pagePrompts.forEach((pp, i) => {
+              const opt = document.createElement("option");
+              opt.value = i;
+              opt.textContent = "Страница " + (pp.page || i + 1);
+              promptPageSelect.appendChild(opt);
+            });
+            promptSystemText.textContent = systemPrompt;
+            function showPromptForPage() {
+              const idx = parseInt(promptPageSelect.value, 10);
+              const pp = pagePrompts[idx];
+              promptUserText.textContent = pp ? (pp.user_prompt || "(пусто)") : "(нет данных)";
+            }
+            showPromptForPage();
+            promptPageSelect.onchange = showPromptForPage;
+          } else {
+            promptUserText.textContent = "(промпты не возвращены)";
+            promptSystemText.textContent = systemPrompt || "(нет)";
+          }
         } catch (err) {
           finishProgress();
           errorBox.textContent = err?.message || String(err);
