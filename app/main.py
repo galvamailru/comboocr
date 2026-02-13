@@ -146,10 +146,11 @@ def _picture_to_base64(element: PictureItem, doc: Any) -> Optional[str]:
 
 def _extract_objects(doc: Any) -> List[Dict[str, Any]]:
     """
-    Извлечь объекты из Docling-документа:
+    Извлечь объекты из Docling-документа (логика как в doclingocr):
     - таблицы (TableItem)
     - изображения (PictureItem)
     - текстовые блоки (остальное с текстом)
+    - при пустом результате — fallback из export_to_dict (blocks/elements).
     """
     objects: List[Dict[str, Any]] = []
 
@@ -185,40 +186,38 @@ def _extract_objects(doc: Any) -> List[Dict[str, Any]]:
 
         objects.append(obj)
 
+    # Fallback to exported dict if list is still empty (как в doclingocr)
+    if not objects and hasattr(doc, "export_to_dict"):
+        data = doc.export_to_dict()
+        blocks = data.get("blocks") or data.get("elements") or []
+        for block in blocks:
+            raw_bbox = block.get("bbox")
+            bbox_rounded = None
+            if raw_bbox is not None:
+                bl = _bbox_to_list(raw_bbox)
+                if bl and len(bl) >= 4:
+                    bbox_rounded = [round(float(x), 1) for x in bl[:4]]
+            objects.append({
+                "type": block.get("category") or block.get("type") or "unknown",
+                "page": block.get("page_no") or block.get("page"),
+                "bbox": bbox_rounded,
+                "text": block.get("text", ""),
+            })
+
     return objects
-
-
-def _make_pipeline_options() -> PdfPipelineOptions:
-    """Создать опции пайплайна; при поддержке — не пропускать колонтитулы (header/footer)."""
-    ocr_options = TesseractCliOcrOptions(lang=["rus", "eng"])
-    base_kw: Dict[str, Any] = {
-        "do_ocr": True,
-        "ocr_options": ocr_options,
-        "generate_picture_images": True,
-    }
-    # Включить захват колонтитулов, если Docling поддерживает соответствующую опцию
-    extra_opts = [
-        ("skip_header_footer", False),
-        ("skip_header_footers", False),
-        ("include_headers_footers", True),
-    ]
-    for opt_name, opt_value in extra_opts:
-        try:
-            pipeline_options = PdfPipelineOptions(**{**base_kw, opt_name: opt_value})
-            logger.info("comboocr: используется опция %s=%s для захвата колонтитулов", opt_name, opt_value)
-            return pipeline_options
-        except TypeError:
-            continue
-    return PdfPipelineOptions(**base_kw)
 
 
 def convert_pdf_with_docling(pdf_path: Path) -> Dict[str, Any]:
     """
-    1) Docling конвертирует PDF в документ;
-    2) Извлекаются объекты (text/table/image), включая колонтитулы при поддержке;
-    3) Возвращается общий текст + список объектов.
+    Конвертация PDF через Docling — та же логика и опции, что в doclingocr,
+    для одинаковой точности сегментации.
     """
-    pipeline_options = _make_pipeline_options()
+    ocr_options = TesseractCliOcrOptions(lang=["rus", "eng"])
+    pipeline_options = PdfPipelineOptions(
+        do_ocr=True,
+        ocr_options=ocr_options,
+        generate_picture_images=True,
+    )
     converter = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
