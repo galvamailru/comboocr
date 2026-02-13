@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     # Для таблиц нужен больший лимит (рукописный текст, много ячеек)
     vllm_max_tokens_table: int = 2048
 
+    # DPI при конвертации PDF в изображения (pdf2image)
+    pdf_dpi: int = 150
+
 
 @lru_cache
 def get_settings() -> Settings:

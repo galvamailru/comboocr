@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pdf2image import convert_from_path
 
+from app.config import get_settings
 from app.vlm_client import run_page_ocr
 
 logger = logging.getLogger(__name__)
@@ -359,7 +360,8 @@ async def parse_pdf(file: UploadFile = File(...)):
             if obj.get("page") is None and docling_objects:
                 obj["page"] = 1
 
-        dpi = 150
+        settings = get_settings()
+        dpi = settings.pdf_dpi
         try:
             page_images_list = convert_from_path(str(tmp_path), dpi=dpi)
         except Exception:  # noqa: BLE001
