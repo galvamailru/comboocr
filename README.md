@@ -30,13 +30,95 @@
 
 ## Запуск vLLM отдельно
 
-vLLM с vision-моделью (Qwen2.5-VL, Ministral-3 и т.д.) нужно запускать на хосте или в отдельном контейнере. Пример на хосте:
+vLLM с vision-моделью (Qwen2.5-VL, Qwen3-VL-235B, Ministral-3 и т.д.) нужно запускать на хосте или в отдельном контейнере.
+
+### Qwen2.5-VL-7B (одна GPU)
 
 ```bash
 vllm serve Qwen/Qwen2.5-VL-7B-Instruct --host 0.0.0.0 --port 8000
 ```
 
-Убедитесь, что в `.env` указан правильный `VLLM_BASE_URL` и что имя модели совпадает с тем, что возвращает `curl http://localhost:8000/v1/models`.
+### Qwen2.5-VL-32B-Instruct (2–4× GPU)
+
+Модель ~32B параметров, веса в FP16/BF16 ~64 GB. Рекомендуется 2× A100 80GB или 4× A100 40GB.
+
+- **2× GPU (например, 2× A100 80GB):**
+
+```bash
+vllm serve Qwen/Qwen2.5-VL-32B-Instruct \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 2 \
+  --mm-encoder-tp-mode data
+```
+
+- **4× GPU (A100 40GB или 80GB), только изображения (без видео):**
+
+```bash
+vllm serve Qwen/Qwen2.5-VL-32B-Instruct \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 4 \
+  --mm-encoder-tp-mode data \
+  --limit-mm-per-prompt '{"image":2,"video":0}'
+```
+
+Опция `--mm-encoder-tp-mode data` разносит vision-encoder по data-parallel и снижает нагрузку на TP. Для экономии памяти можно задать `--max-model-len 65536`.
+
+В `.env` comboocr укажите: `VLLM_MODEL=Qwen/Qwen2.5-VL-32B-Instruct`.
+
+### Qwen3-VL-235B-A22B (8× GPU, ~80 GB каждая)
+
+Модель MoE (~235B параметров, ~22B активных). Требуется несколько GPU (рекомендуется 8× H100 80GB или аналог).
+
+**Установка (vLLM ≥ 0.11, утилиты Qwen-VL):**
+
+```bash
+pip install -U vllm "qwen-vl-utils>=0.0.14"
+```
+
+**Запуск (примеры по железу):**
+
+- **H100, только изображения (без видео), FP8, 4 GPU:**
+
+```bash
+vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 4 \
+  --limit-mm-per-prompt.video 0 \
+  --async-scheduling \
+  --gpu-memory-utilization 0.95 \
+  --max-num-seqs 128
+```
+
+- **H100, FP8, 8 GPU (image + video):**
+
+```bash
+vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
+  --enable-expert-parallel \
+  --async-scheduling
+```
+
+- **A100 / H100, BF16, 8 GPU:**
+
+```bash
+vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 8 \
+  --limit-mm-per-prompt.video 0 \
+  --async-scheduling
+```
+
+После старта vLLM в `.env` comboocr укажите имя модели так, как его возвращает API (обычно совпадает с путём на Hugging Face):
+
+```env
+VLLM_MODEL=Qwen/Qwen3-VL-235B-A22B-Instruct
+# или для FP8:
+# VLLM_MODEL=Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
+```
+
+Проверка: `curl http://localhost:8000/v1/models` — в ответе должно быть нужное `id` модели.
 
 ## Переменные окружения (.env)
 
